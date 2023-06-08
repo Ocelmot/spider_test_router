@@ -61,6 +61,10 @@ impl State {
     async fn init(client: &mut SpiderClient) -> Self {
         // let id = client.self_relation().id;
 
+        let msg = RouterMessage::SetIdentityProperty("name".into(), "Test Router".into());
+        let msg = Message::Router(msg);
+        client.send(msg).await;
+
         // Subscribe to recp dataset
         let recp_dataset = DatasetPath::new_private(vec![String::from("Recp")]);
         let msg = Message::Dataset(DatasetMessage::Subscribe {
@@ -246,6 +250,13 @@ impl State {
             },
             RouterMessage::Subscribe(_) => {},
             RouterMessage::Unsubscribe(_) => {},
+
+            // directory messages
+            RouterMessage::SubscribeDir => {},
+            RouterMessage::UnsubscribeDir => {},
+            RouterMessage::AddIdentity(_) => {},
+            RouterMessage::RemoveIdentity(_) => {},
+            RouterMessage::SetIdentityProperty(_, _) => {},
         }
     }
 }
