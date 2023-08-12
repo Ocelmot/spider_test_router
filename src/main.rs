@@ -2,50 +2,35 @@ use std::{io, path::PathBuf};
 
 use spider_client::{
     message::{
-        DatasetMessage, DatasetPath, Message, UiElement,
-        UiElementContent, UiElementContentPart, UiElementKind, UiMessage, UiPageManager, UiPath, UiInput, RouterMessage, DatasetData,
+        DatasetData, DatasetMessage, DatasetPath, Message, RouterMessage, UiElement,
+        UiElementContent, UiElementContentPart, UiElementKind, UiInput, UiMessage, UiPageManager,
+        UiPath,
     },
-    AddressStrategy, Relation, Role, SpiderClient, SpiderId2048,
+    ClientChannel, ClientResponse, Relation, SpiderClientBuilder,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), io::Error> {
-    println!("Hello, world!");
-
     let client_path = PathBuf::from("client_state.dat");
-    let mut client = if client_path.exists() {
-        SpiderClient::from_file(&client_path)
-    } else {
-        let mut client = SpiderClient::new();
-        client.set_state_path(&client_path);
-        client.add_strat(AddressStrategy::Addr(String::from("localhost:1930")));
-        client.save();
-        client
-    };
 
-    if !client.has_host_relation() {
-        let path = PathBuf::from("spider_keyfile.json");
+    let mut builder = SpiderClientBuilder::load_or_set(&client_path, |builder| {
+        builder.enable_fixed_addrs(true);
+        builder.set_fixed_addrs(vec!["localhost:1930".into()]);
+    });
 
-        let data = match std::fs::read_to_string(&path) {
-            Ok(str) => str,
-            Err(_) => String::from("[]"),
-        };
-        let id: SpiderId2048 = serde_json::from_str(&data).expect("Failed to deserialize spiderid");
-        let host = Relation {
-            id,
-            role: Role::Peer,
-        };
-        client.set_host_relation(host);
-        client.save();
-    }
+    builder.try_use_keyfile("spider_keyfile.json").await;
 
-    client.connect().await;
-    let mut state = State::init(&mut client).await;
+    let mut client_channel = builder.start(true);
+    let mut state = State::init(&mut client_channel).await;
 
     loop {
-        match client.recv().await {
-            Some(msg) => state.msg_handler(&mut client, msg).await,
+        match client_channel.recv().await {
+            Some(ClientResponse::Message(msg)) => {
+                state.msg_handler(&mut client_channel, msg).await;
+            }
+            Some(ClientResponse::Denied(_)) => break,
             None => break, //  done!
+            _ => {}
         }
     }
 
@@ -58,9 +43,7 @@ struct State {
 }
 
 impl State {
-    async fn init(client: &mut SpiderClient) -> Self {
-        // let id = client.self_relation().id;
-
+    async fn init(client: &mut ClientChannel) -> Self {
         let msg = RouterMessage::SetIdentityProperty("name".into(), "Test Router".into());
         let msg = Message::Router(msg);
         client.send(msg).await;
@@ -83,9 +66,8 @@ impl State {
         let msg = Message::Router(RouterMessage::Subscribe(String::from("test_event")));
         client.send(msg).await;
 
-
         // Setup Page
-        let id = client.self_relation().id;
+        let id = client.id();
         let mut test_page = UiPageManager::new(id.clone(), "Router Test Page");
         let mut root = test_page
             .get_element_mut(&UiPath::root())
@@ -104,7 +86,6 @@ impl State {
             let mut element = UiElement::new(UiElementKind::Rows);
             element.set_dataset(Some(recp_dataset.clone().resolve(id.clone())));
             element.append_child({
-
                 let mut child = UiElement::new(UiElementKind::Text);
                 let mut content = UiElementContent::new();
                 content.add_part(UiElementContentPart::Data(vec![]));
@@ -114,7 +95,6 @@ impl State {
             });
             element
         });
-
 
         root.append_child({
             let mut element = UiElement::from_string("Send Msg");
@@ -128,7 +108,6 @@ impl State {
             let mut element = UiElement::new(UiElementKind::Rows);
             element.set_dataset(Some(msgs_dataset.clone().resolve(id.clone())));
             element.append_child({
-
                 let mut child = UiElement::new(UiElementKind::Text);
                 let mut content = UiElementContent::new();
                 content.add_part(UiElementContentPart::Data(vec![]));
@@ -138,7 +117,6 @@ impl State {
             });
             element
         });
-        
 
         drop(root);
 
@@ -154,22 +132,23 @@ impl State {
         }
     }
 
-    async fn msg_handler(&mut self, client: &mut SpiderClient, msg: Message) {
+    async fn msg_handler(&mut self, client: &mut ClientChannel, msg: Message) {
         match msg {
             Message::Ui(msg) => self.ui_handler(client, msg).await,
             Message::Dataset(msg) => self.dataset_handler(client, msg).await,
             Message::Router(msg) => self.router_handler(client, msg).await,
+            Message::Error(_) => {}
         }
     }
 
-    async fn dataset_handler(&mut self, client: &mut SpiderClient, msg: DatasetMessage) {
+    async fn dataset_handler(&mut self, client: &mut ClientChannel, msg: DatasetMessage) {
         println!("Message: {:?}", msg);
         if let DatasetMessage::Dataset { path, data } = msg {
             let recp_dataset = DatasetPath::new_private(vec![String::from("Recp")]);
             let msgs_dataset = DatasetPath::new_private(vec![String::from("Messages")]);
             if path == recp_dataset {
                 self.recps = data;
-            }else if path == msgs_dataset {
+            } else if path == msgs_dataset {
                 self.msgs = data;
                 if self.msgs.len() > 10 {
                     let msgs_dataset = DatasetPath::new_private(vec![String::from("Messages")]);
@@ -183,7 +162,7 @@ impl State {
         }
     }
 
-    async fn ui_handler(&mut self, client: &mut SpiderClient, msg: UiMessage) {
+    async fn ui_handler(&mut self, client: &mut ClientChannel, msg: UiMessage) {
         match msg {
             UiMessage::Subscribe => {}
             UiMessage::Pages(_) => {}
@@ -197,7 +176,7 @@ impl State {
             UiMessage::Input(element_id, _dataset_ids, change) => {
                 match element_id.as_str() {
                     "Add Recp" => {
-                        if let UiInput::Text(text) = change{
+                        if let UiInput::Text(text) = change {
                             let recp_dataset = DatasetPath::new_private(vec![String::from("Recp")]);
                             let data = spider_client::message::DatasetData::String(text);
                             let msg = Message::Dataset(DatasetMessage::Append {
@@ -206,28 +185,28 @@ impl State {
                             });
                             client.send(msg).await;
                         }
-                    },
+                    }
                     "Send Msg" => {
                         // emit message
-                        if let UiInput::Text(text) = change{
+                        if let UiInput::Text(text) = change {
                             // generate recps from data
                             let mut recps = vec![];
-                            for recp in &self.recps{
-                                if let DatasetData::String(recp) = recp{
-                                    if let Some(relation) = Relation::peer_from_base_64(recp){
+                            for recp in &self.recps {
+                                if let DatasetData::String(recp) = recp {
+                                    if let Some(relation) = Relation::peer_from_base_64(recp) {
                                         recps.push(relation);
                                     }
                                 }
                             }
                             let data = spider_client::message::DatasetData::String(text);
                             let msg = Message::Router(RouterMessage::SendEvent(
-                                String::from("test_event"), 
+                                String::from("test_event"),
                                 recps,
-                                data
+                                data,
                             ));
                             client.send(msg).await;
                         }
-                    },
+                    }
                     _ => return,
                 }
             }
@@ -235,9 +214,16 @@ impl State {
         }
     }
 
-    async fn router_handler(&mut self, client: &mut SpiderClient, msg: RouterMessage) {
+    async fn router_handler(&mut self, client: &mut ClientChannel, msg: RouterMessage) {
         match msg {
-            RouterMessage::SendEvent(_, _, _) =>{}
+            // Authorization Messages
+            RouterMessage::Pending => {}
+            RouterMessage::ApprovalCode(_) => {}
+            RouterMessage::Approved => {}
+            RouterMessage::Denied => {}
+
+            // Routing Messages
+            RouterMessage::SendEvent(_, _, _) => {}
             RouterMessage::Event(name, _, data) => {
                 if name == "test_event" {
                     let msgs_dataset = DatasetPath::new_private(vec![String::from("Messages")]);
@@ -247,16 +233,21 @@ impl State {
                     });
                     client.send(msg).await;
                 }
-            },
-            RouterMessage::Subscribe(_) => {},
-            RouterMessage::Unsubscribe(_) => {},
+            }
+            RouterMessage::Subscribe(_) => {}
+            RouterMessage::Unsubscribe(_) => {}
 
             // directory messages
-            RouterMessage::SubscribeDir => {},
-            RouterMessage::UnsubscribeDir => {},
-            RouterMessage::AddIdentity(_) => {},
-            RouterMessage::RemoveIdentity(_) => {},
-            RouterMessage::SetIdentityProperty(_, _) => {},
+            RouterMessage::SubscribeDir => {}
+            RouterMessage::UnsubscribeDir => {}
+            RouterMessage::AddIdentity(_) => {}
+            RouterMessage::RemoveIdentity(_) => {}
+            RouterMessage::SetIdentityProperty(_, _) => {}
+
+            // Chord Messages
+            RouterMessage::SubscribeChord(_) => {}
+            RouterMessage::UnsubscribeChord => {}
+            RouterMessage::ChordAddrs(_) => {}
         }
     }
 }
